@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Table QR Codes</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #111; background: #f4f5f7; }
+  .panel { max-width: 720px; margin: 0 auto; padding: 20px 16px; }
+  h1 { font-size: 22px; margin: 0 0 12px; }
+  label { display: block; font-weight: 600; margin: 12px 0 4px; }
+  input[type=text], input[type=number] { width: 100%; padding: 10px 12px; font-size: 15px; border: 1px solid #ccd; border-radius: 8px; }
+  .row { display: flex; gap: 12px; }
+  .row > div { flex: 1; }
+  .check { display: flex; align-items: center; gap: 8px; font-weight: 400; margin-top: 14px; }
+  .buttons { display: flex; gap: 10px; margin-top: 18px; flex-wrap: wrap; }
+  button { padding: 12px 18px; font-size: 15px; font-weight: 600; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
+  button.secondary { background: #dde1e7; color: #111; }
+  .hint { color: #667; font-size: 13px; margin-top: 4px; }
+
+  .sheet { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; max-width: 720px; margin: 0 auto; padding: 0 16px 40px; }
+  .card { background: #fff; border: 2px dashed #bbb; border-radius: 12px; padding: 18px; text-align: center; break-inside: avoid; page-break-inside: avoid; }
+  .card .t { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; color: #555; }
+  .card .n { font-size: 44px; font-weight: 800; line-height: 1.05; margin-bottom: 10px; }
+  .card .qr { display: flex; justify-content: center; margin: 6px 0 12px; }
+  .card ol { text-align: left; font-size: 13px; margin: 0; padding-left: 18px; color: #222; }
+  .card .url { font-size: 9px; color: #999; word-break: break-all; margin-top: 8px; }
+
+  @media (max-width: 520px) { .sheet { grid-template-columns: 1fr; } }
+  @media print {
+    body { background: #fff; }
+    .panel { display: none; }
+    .sheet { padding: 0; gap: 10mm; grid-template-columns: repeat(2, 1fr); }
+    .card { height: 128mm; }
+    @page { size: A4; margin: 10mm; }
+  }
+</style>
+</head>
+<body>
+<div class="panel">
+  <h1>Table QR codes</h1>
+  <label for="base">Recording page address</label>
+  <input id="base" type="text" placeholder="https://your-username.github.io/table-recorder/">
+  <div class="hint">Filled in automatically when this page is hosted on the same site.</div>
+  <div class="row">
+    <div><label for="from">First table</label><input id="from" type="number" min="1" value="1"></div>
+    <div><label for="to">Last table</label><input id="to" type="number" min="1" value="8"></div>
+  </div>
+  <label class="check"><input id="extra" type="checkbox"> Generate a 2nd QR code (“b”) per table, for long tables</label>
+  <div class="buttons">
+    <button id="gen">Generate</button>
+    <button id="print" class="secondary">Print</button>
+  </div>
+</div>
+<div class="sheet" id="sheet"></div>
+
+<script>
+const baseInput = document.getElementById('base');
+const guess = location.href.replace(/qr\.html.*$/, '').split('?')[0];
+if (/^https?:/.test(guess)) baseInput.value = guess;
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
+function generate() {
+  let base = baseInput.value.trim();
+  if (!base) { alert('Please enter the recording page address.'); return; }
+  if (!/index\.html$/.test(base) && !base.endsWith('/')) base += '/';
+  const from = parseInt(document.getElementById('from').value, 10) || 1;
+  const to = parseInt(document.getElementById('to').value, 10) || from;
+  const extra = document.getElementById('extra').checked;
+
+  const ids = [];
+  for (let i = from; i <= to; i++) {
+    ids.push(pad(i));
+    if (extra) ids.push(pad(i) + 'b');
+  }
+
+  const sheet = document.getElementById('sheet');
+  sheet.innerHTML = '';
+  ids.forEach((id) => {
+    const url = base + '?table=' + encodeURIComponent(id);
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.innerHTML =
+      '<div class="t">Table</div><div class="n">' + id + '</div><div class="qr"></div>' +
+      '<ol><li>Scan with your phone camera</li><li>Tap <b>Start recording</b> and allow the microphone</li>' +
+      '<li>Leave the phone flat on the table, screen up, and don\'t lock it</li><li>Tap <b>End session</b> when you finish</li></ol>' +
+      '<div class="url"></div>';
+    card.querySelector('.url').textContent = url;
+    sheet.appendChild(card);
+    new QRCode(card.querySelector('.qr'), { text: url, width: 200, height: 200, correctLevel: QRCode.CorrectLevel.M });
+  });
+}
+
+document.getElementById('gen').addEventListener('click', generate);
+document.getElementById('print').addEventListener('click', () => { if (!document.querySelector('.card')) generate(); window.print(); });
+</script>
+</body>
+</html>

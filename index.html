@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111418">
+<title>Table Recorder</title>
+<style>
+  :root {
+    --bg: #111418; --card: #1b2027; --text: #f2f4f7; --muted: #9aa4b2;
+    --accent: #e5484d; --ok: #30a46c; --warn: #f5a524; --line: #2a313b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  main {
+    min-height: 100%; max-width: 480px; margin: 0 auto;
+    padding: max(24px, env(safe-area-inset-top)) 20px max(24px, env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center; gap: 18px; text-align: center;
+  }
+  .label { color: var(--muted); text-transform: uppercase; letter-spacing: .12em; font-size: 13px; margin-top: 8px; }
+  .table-id { font-size: 64px; font-weight: 800; line-height: 1; margin-top: -8px; }
+  .status { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+  .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--muted); }
+  .recording .dot { background: var(--accent); animation: pulse 1.2s infinite; }
+  .saved .dot { background: var(--ok); }
+  @keyframes pulse { 50% { opacity: .25; } }
+  .timer { font-variant-numeric: tabular-nums; font-size: 44px; font-weight: 300; letter-spacing: .02em; }
+  .meter { width: 100%; height: 10px; background: var(--card); border-radius: 6px; overflow: hidden; }
+  .meter > div { height: 100%; width: 0%; background: var(--ok); transition: width .08s linear; }
+  .btn {
+    width: 100%; border: 0; border-radius: 16px; padding: 22px; font-size: 20px; font-weight: 700;
+    color: #fff; cursor: pointer; -webkit-tap-highlight-color: transparent;
+  }
+  .btn:active { transform: scale(.98); }
+  .start { background: var(--accent); }
+  .stop { background: var(--card); border: 1px solid var(--line); color: var(--text); }
+  .resume { background: var(--warn); color: #111; }
+  .info { color: var(--muted); font-size: 14px; min-height: 20px; margin: 0; }
+  .tips { background: var(--card); border-radius: 14px; padding: 14px 16px; text-align: left; font-size: 15px; width: 100%; }
+  .tips ol { margin: 6px 0 0; padding-left: 20px; }
+  .warn { background: #3a2a0a; color: #ffd58a; border-radius: 12px; padding: 12px 14px; font-size: 15px; width: 100%; }
+  .error { background: #3b1214; color: #ffb4b6; }
+  .consent { color: var(--muted); font-size: 13px; margin: 0; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main id="app">
+  <div class="label">Table</div>
+  <div class="table-id" id="tableId">—</div>
+
+  <div class="status" id="status"><span class="dot"></span><span id="statusText">Ready to record</span></div>
+  <div class="timer" id="timer">00:00:00</div>
+  <div class="meter" aria-hidden="true"><div id="level"></div></div>
+
+  <button class="btn start" id="startBtn">Start recording</button>
+  <button class="btn resume" id="resumeBtn" hidden>Resume recording</button>
+  <button class="btn stop" id="stopBtn" hidden>End session</button>
+
+  <p class="info" id="info"></p>
+  <div class="warn" id="warn" hidden></div>
+
+  <div class="tips" id="tips">
+    <strong>How it works</strong>
+    <ol>
+      <li>Tap <b>Start recording</b> and allow the microphone.</li>
+      <li>Place the phone flat in the middle of the table, screen up.</li>
+      <li>Keep this page open and <b>don't lock the phone</b>.</li>
+      <li>When you're done, tap <b>End session</b>.</li>
+    </ol>
+  </div>
+  <p class="consent">By starting, you confirm that everyone at this table has agreed to be recorded.</p>
+</main>
+
+<script>
+/* ======== CONFIGURATION — fill in before publishing ======== */
+const CONFIG = {
+  SCRIPT_URL: 'PASTE_YOUR_APPS_SCRIPT_URL_HERE', // ends with /exec
+  TOKEN: 'PASTE_A_RANDOM_TOKEN_HERE',            // same value as in Code.gs
+  CHUNK_SECONDS: 30,                             // upload one chunk every 30 s
+  BITRATE: 48000,                                // 48 kbps: good voice quality, ~22 MB/hour
+};
+/* ============================================================ */
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+// "?table=07". The legacy "?mesa=07" is still accepted so previously printed QR codes keep working.
+const tableId = (params.get('table') || params.get('mesa') || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 20);
+
+let stream = null, recorder = null, audioCtx = null, rafId = null;
+let wakeLock = null, timerId = null, startedAt = 0;
+let session = null, sessionMime = '', seq = 0;
+let userStopping = false, recording = false;
+const queue = [];
+let pumping = false, sentCount = 0, failStreak = 0, lastError = '';
+
+/* ---------- UI ---------- */
+function setStatus(text, cls) {
+  $('statusText').textContent = text;
+  $('status').className = 'status ' + (cls || '');
+}
+function showWarn(msg, isError) {
+  const w = $('warn');
+  if (!msg) { w.hidden = true; return; }
+  w.textContent = msg; w.hidden = false;
+  w.className = 'warn' + (isError ? ' error' : '');
+}
+function fmt(ms) {
+  const s = Math.floor(ms / 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return p(Math.floor(s / 3600)) + ':' + p(Math.floor(s / 60) % 60) + ':' + p(s % 60);
+}
+function updateInfo() {
+  const waiting = queue.filter((q) => q.type === 'chunk').length;
+  let t = sentCount ? `Saved to cloud: ${sentCount} part${sentCount > 1 ? 's' : ''}` : '';
+  if (waiting) t += (t ? ' · ' : '') + `waiting to upload: ${waiting}`;
+  if (failStreak) t += ' · connection problem, retrying…';
+  $('info').textContent = t;
+}
+
+/* ---------- Setup ---------- */
+$('tableId').textContent = tableId || '?';
+if (!tableId) {
+  showWarn('This link has no table number. Please scan the QR code on your table again.', true);
+  $('startBtn').disabled = true;
+} else if (CONFIG.SCRIPT_URL.startsWith('PASTE_')) {
+  showWarn('Setup incomplete: SCRIPT_URL is not configured in index.html.', true);
+  $('startBtn').disabled = true;
+} else if (CONFIG.TOKEN.startsWith('PASTE_')) {
+  showWarn('Setup incomplete: TOKEN is not configured in index.html.', true);
+  $('startBtn').disabled = true;
+} else if (!window.MediaRecorder || !navigator.mediaDevices) {
+  showWarn('This browser cannot record audio. Please open the link in Chrome (Android) or Safari (iPhone).', true);
+  $('startBtn').disabled = true;
+}
+
+/* ---------- Recording ---------- */
+function pickMime() {
+  const opts = ['audio/webm;codecs=opus', 'audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm'];
+  return opts.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+}
+function newSessionId() {
+  const d = new Date(), p = (n) => String(n).padStart(2, '0');
+  const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+  return `${tableId}-${stamp}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+async function startRecording() {
+  $('startBtn').disabled = true; $('resumeBtn').disabled = true;
+  showWarn('');
+  // Must be created inside the user's tap (iPhone requirement)
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    audioCtx.resume();
+  } catch (e) { audioCtx = null; }
+
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true },
+    });
+  } catch (e) {
+    showWarn('Microphone access was blocked. Allow the microphone for this site in your browser settings and try again.', true);
+    $('startBtn').disabled = false; $('resumeBtn').disabled = false;
+    return;
+  }
+
+  const mime = pickMime();
+  const opts = { audioBitsPerSecond: CONFIG.BITRATE };
+  if (mime) opts.mimeType = mime;
+  try {
+    recorder = new MediaRecorder(stream, opts);
+  } catch (e) {
+    recorder = new MediaRecorder(stream);
+  }
+
+  session = newSessionId();
+  sessionMime = recorder.mimeType || mime || 'audio/webm';
+  seq = 0;
+  userStopping = false;
+
+  const mySession = session, myMime = sessionMime;
+  recorder.ondataavailable = (e) => {
+    if (e.data && e.data.size > 0) {
+      queue.push({ type: 'chunk', session: mySession, mime: myMime, seq: seq++, blob: e.data });
+      updateInfo();
+      pump();
+    }
+  };
+  recorder.onstop = () => onRecorderStopped(mySession);
+  recorder.onerror = () => { try { recorder.stop(); } catch (e) {} };
+  stream.getAudioTracks().forEach((t) => {
+    t.onended = () => { if (recorder && recorder.state !== 'inactive') recorder.stop(); };
+  });
+
+  recorder.start(CONFIG.CHUNK_SECONDS * 1000);
+  recording = true;
+  startedAt = Date.now();
+  timerId = setInterval(() => { $('timer').textContent = fmt(Date.now() - startedAt); }, 500);
+  startMeter();
+  keepAwake();
+
+  setStatus('Recording', 'recording');
+  $('startBtn').hidden = true; $('resumeBtn').hidden = true;
+  $('stopBtn').hidden = false; $('stopBtn').disabled = false;
+  $('tips').hidden = true;
+}
+
+function onRecorderStopped(stoppedSession) {
+  recording = false;
+  clearInterval(timerId);
+  stopMeter();
+  releaseAwake();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null;
+
+  // Close the session on Drive (merges the chunks into one file)
+  queue.push({ type: 'finish', session: stoppedSession });
+  pump();
+
+  $('stopBtn').hidden = true;
+  if (userStopping) {
+    setStatus('Saving…', '');
+    waitForUploads();
+  } else {
+    // Stopped without the user asking (screen locked, phone call, etc.)
+    setStatus('Recording interrupted', '');
+    showWarn('The recording stopped (the phone may have locked or another app used the microphone). What was recorded is saved. Tap below to continue in a new recording.');
+    $('resumeBtn').hidden = false; $('resumeBtn').disabled = false;
+  }
+}
+
+function stopRecording() {
+  if (!recorder || recorder.state === 'inactive') return;
+  if (!confirm('End the recording for this table?')) return;
+  userStopping = true;
+  $('stopBtn').disabled = true;
+  recorder.stop(); // emits the last chunk, then fires onstop
+}
+
+function waitForUploads() {
+  const check = () => {
+    if (queue.length === 0 && !pumping) {
+      setStatus('Saved ✓', 'saved');
+      $('info').textContent = 'The recording is safely stored. You can close this page.';
+      showWarn('');
+    } else {
+      updateInfo();
+      setTimeout(check, 1000);
+    }
+  };
+  check();
+}
+
+/* ---------- Upload (queue with automatic retry) ---------- */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',')[1] || '');
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
+}
+
+async function sendItem(item) {
+  const body = { token: CONFIG.TOKEN, table: tableId, session: item.session };
+  if (item.type === 'chunk') {
+    body.action = 'chunk';
+    body.seq = item.seq;
+    body.mime = item.mime;
+    body.data = await blobToBase64(item.blob);
+  } else {
+    body.action = 'finish';
+  }
+  // text/plain avoids the CORS "preflight" request, which Apps Script does not support
+  const res = await fetch(CONFIG.SCRIPT_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify(body),
+    redirect: 'follow',
+  });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || 'server error');
+  return json;
+}
+
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  while (queue.length) {
+    const item = queue[0];
+    try {
+      await sendItem(item);
+      queue.shift();
+      if (item.type === 'chunk') sentCount++;
+      failStreak = 0; lastError = '';
+    } catch (e) {
+      failStreak++;
+      lastError = String(e && e.message || e);
+      if (lastError === 'token') showWarn('Setup error: TOKEN does not match the server. Contact the organizer.', true);
+      updateInfo();
+      await sleep(Math.min(30000, 2000 * Math.pow(2, Math.min(failStreak, 4))));
+    }
+    updateInfo();
+  }
+  pumping = false;
+  updateInfo();
+}
+window.addEventListener('online', pump);
+
+/* ---------- Keep the screen on ---------- */
+async function keepAwake() {
+  if (!('wakeLock' in navigator)) {
+    showWarn('Your browser may let the screen turn off. Please set auto-lock to "Never" or keep touching the screen now and then.');
+    return;
+  }
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+  } catch (e) { /* retried when the page becomes visible again */ }
+}
+function releaseAwake() {
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    if (recording) keepAwake();
+    pump();
+  }
+});
+
+/* ---------- Input level meter ---------- */
+function startMeter() {
+  if (!audioCtx || !stream) return;
+  try {
+    const src = audioCtx.createMediaStreamSource(stream);
+    const an = audioCtx.createAnalyser();
+    an.fftSize = 1024;
+    src.connect(an);
+    const data = new Uint8Array(an.fftSize);
+    const tick = () => {
+      an.getByteTimeDomainData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) { const v = (data[i] - 128) / 128; sum += v * v; }
+      const rms = Math.sqrt(sum / data.length);
+      $('level').style.width = Math.min(100, rms * 400) + '%';
+      rafId = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch (e) { /* the meter is cosmetic only */ }
+}
+function stopMeter() {
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = null;
+  $('level').style.width = '0%';
+}
+
+/* ---------- Safeguards ---------- */
+window.addEventListener('beforeunload', (e) => {
+  if (recording || queue.length) { e.preventDefault(); e.returnValue = ''; }
+});
+
+$('startBtn').addEventListener('click', startRecording);
+$('resumeBtn').addEventListener('click', startRecording);
+$('stopBtn').addEventListener('click', stopRecording);
+</script>
+</body>
+</html>
